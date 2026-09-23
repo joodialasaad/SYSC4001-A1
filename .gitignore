@@ -1,0 +1,3 @@
+*.o
+scheduler
+__pycache__/
