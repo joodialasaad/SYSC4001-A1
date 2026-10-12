@@ -25,9 +25,15 @@
  * order, and RR quantum usage.
  */
 typedef struct {
-    ProcessSpec spec;
+    ProcessSpec spec; //specification 
     ProcessState state;
     /* TODO: add the rest of your PCB fields. */
+    int remaining_cpu; // -- when process execures a cpu tick
+    int completed_bursts; // ++ when a cpu burst ends
+    int io_completion_time; // store simulated time when process ends io
+
+    long long ready_order; //when a process enters ready queeue to preserve FIFO 
+    int quantum_used; //++ as process uses its RR time slice 
 } PCB;
 
 /* You may choose to maintain a structure for your queues.
