@@ -44,7 +44,11 @@ typedef struct {
  * Store whatever you feel is necessary for your implementation.
  */
 typedef struct {
-    size_t process_count;
+    PCB *pcbs; //array containing every process
+    size_t process_count; //n of processes
+    int current_time; //simulation clock
+    int running_index; //index of current running process (-1 if none is running)
+    long long next_ready_order; // counter used to preserve the order of whuch processes enter the ready queue
 } Simulation;
 
 /*
