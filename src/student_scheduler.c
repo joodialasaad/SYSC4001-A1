@@ -1,6 +1,8 @@
 #include "scheduler.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
 
 /*
  * This is the source file you must complete.
@@ -111,7 +113,24 @@ typedef struct {
  * You must design and implement the loop yourself. The reference outputs care
  * about observable timing and ordering, not the names of your private helpers.
  */
+PCB *initialize_pcbs(const ProcessSpec *specs, size_t process_count){
+    PCB *pcbs = calloc(process_count, sizeof(PCB));
 
+    if(pcbs == NULL){
+        return NULL;
+    }
+
+    for(size_t i=0; i < process_count; i++){
+        pcbs[i].spec = specs[i]; 
+        pcbs[i].state = STATE_NEW;
+        pcbs[i].remaining_cpu = specs[i].cpu_burst;
+        pcbs[i].completed_bursts = 0;
+        pcbs[i].io_completion_time = -1;
+        pcbs[i].ready_order = -1;
+        pcbs[i].quantum_used = 0;
+    }
+    return pcbs;
+}
 /*
  * Run one complete scheduling simulation.
  *
@@ -145,13 +164,44 @@ bool run_simulation(const ProcessSpec *specs,
                     const SimulationConfig *config,
                     OutputContext *output)
 {
-    (void)specs;
-    (void)count;
-    (void)config;
-    (void)output;
 
-    fprintf(stderr,
-            "run_simulation() is not implemented. See the guidance in "
-            "src/student_scheduler.c.\n");
-    return false;
+    PCB *pcbs = initialize_pcbs(specs, count);
+
+    if (pcbs == NULL) {
+        return false;
+    }
+    int current_time = 0;
+    int running_index = -1;
+    long long next_ready_order = 0;
+
+    int *ready_queue = malloc(count * sizeof(int));
+    if (ready_queue == NULL){
+        free(pcbs);
+        return false;
+    }
+    size_t ready_count = 0;
+
+    //ARRIVAL LOOP
+    for(size_t i = 0; i < count; i++){
+        if(pcbs[i].state == STATE_NEW && 
+            specs[i].arrival_time == current_time){
+
+            ProcessState old_state = pcbs[i].state;
+
+            pcbs[i].state = STATE_READY;
+            pcbs[i].ready_order = next_ready_order;
+            next_ready_order++;
+            
+            ready_queue[ready_count] = (int)i;
+            ready_count++;
+            
+            log_transition(output,
+                        current_time,
+                        pcbs[i].spec.pid,
+                        old_state,
+                        pcbs[i].state,
+                        REASON_ARRIVAL);
+        }
+    }
+
 }
