@@ -131,6 +131,25 @@ PCB *initialize_pcbs(const ProcessSpec *specs, size_t process_count){
     }
     return pcbs;
 }
+
+void complete_cpu_burst(PCB *pcbs, int running_index, int current_time, OutputContext *output){
+    PCB *pcb = &pcbs[running_index];
+    pcb->completed_bursts++;
+
+    if(pcb->completed_bursts == pcb->spec.num_cpu_bursts){
+        ProcessState old_state = pcb->state;
+        pcb->state = STATE_TERMINATED;
+
+        log_transition(output,current_time, pcb->spec.pid, old_state, pcb->state, REASON_PROCESS_COMPLETE);
+    
+    }
+    else {
+        ProcessState old_state = pcb->state;
+        pcb->state = STATE_WAITING;
+        log_transition(output, current_time, pcb->spec.pid, old_state, pcb->state, REASON_CPU_BURST_COMPLETE);
+        pcb->io_completion_time = current_time + pcb->spec.io_burst;
+    }
+}
 /*
  * Run one complete scheduling simulation.
  *
@@ -164,44 +183,304 @@ bool run_simulation(const ProcessSpec *specs,
                     const SimulationConfig *config,
                     OutputContext *output)
 {
-
     PCB *pcbs = initialize_pcbs(specs, count);
 
     if (pcbs == NULL) {
         return false;
     }
-    int current_time = 0;
-    int running_index = -1;
-    long long next_ready_order = 0;
 
     int *ready_queue = malloc(count * sizeof(int));
-    if (ready_queue == NULL){
+    if (ready_queue == NULL) {
         free(pcbs);
         return false;
     }
+
+    int current_time = 0;
+    int running_index = -1;
+    int switch_remaining = 0;
+    bool switch_in_progress = false;
+    bool dispatch_after_switch = false;
+
+    long long next_ready_order = 0;
     size_t ready_count = 0;
+    size_t terminated_count = 0;
 
-    //ARRIVAL LOOP
-    for(size_t i = 0; i < count; i++){
-        if(pcbs[i].state == STATE_NEW && 
-            specs[i].arrival_time == current_time){
+    while (terminated_count < count) {
 
-            ProcessState old_state = pcbs[i].state;
+        /*
+         * Resolve the CPU interval that ended at current_time.
+         */
+        if (running_index != -1 &&
+            pcbs[running_index].remaining_cpu > 0 &&
+            config->algorithm == ALG_RR &&
+            pcbs[running_index].quantum_used >= config->quantum) {
 
-            pcbs[i].state = STATE_READY;
-            pcbs[i].ready_order = next_ready_order;
-            next_ready_order++;
-            
-            ready_queue[ready_count] = (int)i;
-            ready_count++;
-            
-            log_transition(output,
-                        current_time,
-                        pcbs[i].spec.pid,
-                        old_state,
-                        pcbs[i].state,
-                        REASON_ARRIVAL);
+            int expired_index = running_index;
+            running_index = -1;
+
+            ProcessState old_state = pcbs[expired_index].state;
+            pcbs[expired_index].state = STATE_READY;
+            pcbs[expired_index].ready_order = next_ready_order++;
+            pcbs[expired_index].quantum_used = 0;
+
+            ready_queue[ready_count++] = expired_index;
+
+            log_transition(output, current_time,
+                           pcbs[expired_index].spec.pid,
+                           old_state, pcbs[expired_index].state,
+                           REASON_QUANTUM_EXPIRED);
         }
+
+        /*
+         * Admit arrivals, in ascending PID order.
+         */
+        for (size_t i = 0; i < count; i++) {
+            if (pcbs[i].state == STATE_NEW &&
+                pcbs[i].spec.arrival_time == current_time) {
+
+                ProcessState old_state = pcbs[i].state;
+                pcbs[i].state = STATE_READY;
+                pcbs[i].ready_order = next_ready_order++;
+
+                ready_queue[ready_count++] = (int)i;
+
+                log_transition(output, current_time,
+                               pcbs[i].spec.pid,
+                               old_state, pcbs[i].state,
+                               REASON_ARRIVAL);
+            }
+        }
+
+        /*
+         *Complete I/O operations, in ascending PID order.
+         */
+        for (size_t i = 0; i < count; i++) {
+            if (pcbs[i].state == STATE_WAITING &&
+                pcbs[i].io_completion_time == current_time) {
+
+                ProcessState old_state = pcbs[i].state;
+                pcbs[i].state = STATE_READY;
+                pcbs[i].ready_order = next_ready_order++;
+
+                ready_queue[ready_count++] = (int)i;
+
+                log_transition(output, current_time,
+                               pcbs[i].spec.pid,
+                               old_state, pcbs[i].state,
+                               REASON_IO_COMPLETE);
+            }
+        }
+
+        /*
+         *SRTF preemption
+         */
+        if (config->algorithm == ALG_SRTF &&
+            running_index != -1 &&
+            ready_count > 0) {
+
+            size_t best_position = 0;
+
+            for (size_t i = 1; i < ready_count; i++) {
+                int candidate = ready_queue[i];
+                int current_best = ready_queue[best_position];
+
+                if (pcbs[candidate].remaining_cpu <
+                    pcbs[current_best].remaining_cpu) {
+                    best_position = i;
+                }
+            }
+
+            int best_index = ready_queue[best_position];
+
+            if (pcbs[best_index].remaining_cpu <
+                pcbs[running_index].remaining_cpu) {
+
+                int preempted_index = running_index;
+                running_index = -1;
+
+                ProcessState old_state = pcbs[preempted_index].state;
+                pcbs[preempted_index].state = STATE_READY;
+                pcbs[preempted_index].ready_order = next_ready_order++;
+
+                log_transition(output, current_time,
+                               pcbs[preempted_index].spec.pid,
+                               old_state, pcbs[preempted_index].state,
+                               REASON_SRTF_PREEMPTION);
+
+                ready_queue[ready_count++] = preempted_index;
+            }
+        }
+
+        /*
+         *Dispatch and context-switch handling
+         */
+        bool tick_recorded = false;
+
+        if (running_index == -1 && dispatch_after_switch) {
+            dispatch_after_switch = false;
+
+            if (ready_count > 0) {
+                size_t selected_position = 0;
+
+                if (config->algorithm == ALG_SRTF) {
+                    for (size_t i = 1; i < ready_count; i++) {
+                        int candidate = ready_queue[i];
+                        int selected = ready_queue[selected_position];
+
+                        if (pcbs[candidate].remaining_cpu <
+                                pcbs[selected].remaining_cpu ||
+                            (pcbs[candidate].remaining_cpu ==
+                                pcbs[selected].remaining_cpu &&
+                             (pcbs[candidate].ready_order <
+                                  pcbs[selected].ready_order ||
+                              (pcbs[candidate].ready_order ==
+                                   pcbs[selected].ready_order &&
+                               pcbs[candidate].spec.pid <
+                                   pcbs[selected].spec.pid)))) {
+                            selected_position = i;
+                        }
+                    }
+                }
+
+                running_index = ready_queue[selected_position];
+
+                for (size_t i = selected_position + 1;
+                     i < ready_count; i++) {
+                    ready_queue[i - 1] = ready_queue[i];
+                }
+                ready_count--;
+
+                ProcessState old_state = pcbs[running_index].state;
+                pcbs[running_index].state = STATE_RUNNING;
+                pcbs[running_index].quantum_used = 0;
+
+                log_transition(output, current_time,
+                               pcbs[running_index].spec.pid,
+                               old_state, pcbs[running_index].state,
+                               REASON_DISPATCH);
+            }
+        }
+        else if (running_index == -1 && switch_in_progress) {
+            record_timeline_tick(output, current_time,
+                                 ACTIVITY_CONTEXT_SWITCH, 0);
+            tick_recorded = true;
+
+            switch_remaining--;
+
+            if (switch_remaining == 0) {
+                switch_in_progress = false;
+                dispatch_after_switch = true;
+            }
+        }
+        else if (running_index == -1 && ready_count > 0) {
+
+            if (config->context_switch > 0) {
+                switch_in_progress = true;
+                switch_remaining = config->context_switch;
+
+                record_timeline_tick(output, current_time,
+                                     ACTIVITY_CONTEXT_SWITCH, 0);
+                tick_recorded = true;
+
+                switch_remaining--;
+
+                if (switch_remaining == 0) {
+                    switch_in_progress = false;
+                    dispatch_after_switch = true;
+                }
+            }
+            else {
+                size_t selected_position = 0;
+
+                if (config->algorithm == ALG_SRTF) {
+                    for (size_t i = 1; i < ready_count; i++) {
+                        int candidate = ready_queue[i];
+                        int selected = ready_queue[selected_position];
+
+                        if (pcbs[candidate].remaining_cpu <
+                                pcbs[selected].remaining_cpu ||
+                            (pcbs[candidate].remaining_cpu ==
+                                pcbs[selected].remaining_cpu &&
+                             (pcbs[candidate].ready_order <
+                                  pcbs[selected].ready_order ||
+                              (pcbs[candidate].ready_order ==
+                                   pcbs[selected].ready_order &&
+                               pcbs[candidate].spec.pid <
+                                   pcbs[selected].spec.pid)))) {
+                            selected_position = i;
+                        }
+                    }
+                }
+
+                running_index = ready_queue[selected_position];
+
+                for (size_t i = selected_position + 1;
+                     i < ready_count; i++) {
+                    ready_queue[i - 1] = ready_queue[i];
+                }
+                ready_count--;
+
+                ProcessState old_state = pcbs[running_index].state;
+                pcbs[running_index].state = STATE_RUNNING;
+                pcbs[running_index].quantum_used = 0;
+
+                log_transition(output, current_time,
+                               pcbs[running_index].spec.pid,
+                               old_state, pcbs[running_index].state,
+                               REASON_DISPATCH);
+            }
+        }
+
+        /*
+         *Execute exactly one interval and update CPU-burst accounting
+         */
+        if (!tick_recorded) {
+            if (running_index != -1) {
+                int executing_index = running_index;
+
+                record_timeline_tick(output, current_time,
+                                     ACTIVITY_CPU,
+                                     pcbs[executing_index].spec.pid);
+
+                pcbs[executing_index].remaining_cpu--;
+                pcbs[executing_index].quantum_used++;
+
+                if (pcbs[executing_index].remaining_cpu == 0) {
+                    complete_cpu_burst(pcbs, executing_index,
+                                       current_time + 1, output);
+
+                    if (pcbs[executing_index].state ==
+                        STATE_TERMINATED) {
+                        terminated_count++;
+                    } else {
+                        pcbs[executing_index].io_completion_time =
+                            current_time + 1 +
+                            pcbs[executing_index].spec.io_burst;
+
+                        pcbs[executing_index].remaining_cpu =
+                            pcbs[executing_index].spec.cpu_burst;
+                    }
+
+                    running_index = -1;
+                }
+            }
+            else {
+                record_timeline_tick(output, current_time,
+                                     ACTIVITY_IDLE, 0);
+            }
+        }
+
+        if (terminated_count == count) {
+            break;
+        }
+
+        current_time++;
     }
 
+    bool success = write_metrics(output, specs, count);
+
+    free(ready_queue);
+    free(pcbs);
+
+    return success;
 }
